@@ -3,6 +3,7 @@
 //
 
 #include "async_infer_request.h"
+#include "compiled_model.h"
 
 #include <memory>
 #include <vector>

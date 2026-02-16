@@ -105,6 +105,19 @@ void SyncInferRequest::update_external_tensor_ptrs() {
 void SyncInferRequest::infer() {
     OV_ITT_SCOPED_TASK_BASE(itt::domains::ov_cpu_inference,
                             std::string("SyncInferenceCPU::infer::") + m_compiled_model.name());
+    // Bind per-stream graph selection to this worker thread via TLS
+    struct GraphIdxGuard {
+        int prev;
+        GraphIdxGuard(int idx) {
+            prev = ov::intel_cpu::CompiledModel::current_graph_idx();
+            if (idx >= 0) {
+                ov::intel_cpu::CompiledModel::set_current_graph_idx(idx);
+            }
+        }
+        ~GraphIdxGuard() {
+            ov::intel_cpu::CompiledModel::set_current_graph_idx(-1);
+        }
+    } graph_guard{m_asyncRequest ? m_asyncRequest->get_stream_index() : -1};
     auto graphLock = m_compiled_model.lock();
     auto&& graph = graphLock._graph;
     auto message = ov::threading::message_manager();
@@ -113,6 +126,7 @@ void SyncInferRequest::infer() {
     if (m_asyncRequest->m_has_sub_infers) {
         sub_streams_infer();
         message->server_wait();
+        // TLS guard will reset on scope exit
         return;
     }
 
@@ -149,6 +163,7 @@ void SyncInferRequest::infer() {
     }
 
     graph.PullOutputData(m_outputs);
+    // TLS guard resets automatically
 }
 
 std::vector<ov::ProfilingInfo> SyncInferRequest::get_profiling_info() const {

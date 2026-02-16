@@ -67,6 +67,10 @@ public:
         return m_name;
     }
 
+    // Per-thread graph index control for correct graph selection with per-stream executors
+    static void set_current_graph_idx(int idx);
+    static int current_graph_idx();
+
 private:
     std::shared_ptr<ov::ISyncInferRequest> create_sync_infer_request() const override;
     friend class CompiledModelHolder;
@@ -102,6 +106,10 @@ private:
     std::shared_ptr<SubMemoryManager> m_sub_memory_manager = nullptr;
     bool m_has_sub_compiled_models = false;
     bool m_optimized_single_stream = false;
+
+    // Per-stream executors for binding one infer request to one stream
+    std::vector<std::shared_ptr<ov::threading::ITaskExecutor>> m_stream_executors;
+    mutable std::atomic<int> m_next_stream{0};
 };
 
 // This class provides safe access to the internal CompiledModel structures and helps to decouple SyncInferRequest and

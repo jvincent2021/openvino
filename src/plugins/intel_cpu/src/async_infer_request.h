@@ -36,6 +36,14 @@ public:
         m_has_sub_infers = has_sub_infer;
     }
 
+    void set_stream_index(int idx) {
+        m_stream_index = idx;
+    }
+
+    int get_stream_index() const {
+        return m_stream_index;
+    }
+
     void throw_if_canceled() const;
 
     std::vector<std::shared_ptr<ov::IAsyncInferRequest>> m_sub_infer_requests;
@@ -43,6 +51,8 @@ public:
     std::shared_ptr<IInferRequest> m_internal_request;
     std::shared_ptr<ov::threading::IStreamsExecutor> m_stream_executor;
     std::function<void()> m_infer_func;
+    int m_stream_index{-1};
 };
 
 }  // namespace ov::intel_cpu
+n

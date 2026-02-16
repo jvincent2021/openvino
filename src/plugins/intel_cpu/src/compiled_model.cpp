@@ -51,6 +51,17 @@ using namespace ov::threading;
 
 namespace ov::intel_cpu {
 
+// Thread-local index for selecting the appropriate graph per stream
+static thread_local int s_current_graph_idx_tls = -1;
+
+void CompiledModel::set_current_graph_idx(int idx) {
+    s_current_graph_idx_tls = idx;
+}
+
+int CompiledModel::current_graph_idx() {
+    return s_current_graph_idx_tls;
+}
+
 struct ImmediateSerialExecutor : public ov::threading::ITaskExecutor {
     void run(ov::threading::Task task) override {
         std::lock_guard<std::mutex> l{_mutex};
@@ -99,51 +110,87 @@ CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
                                                                              false,
                                                                              true}
                                                   : m_cfg.streamExecutorConfig;
-        m_task_executor = m_plugin->get_executor_manager()->get_idle_cpu_streams_executor(executor_config);
+        //m_task_executor = m_plugin->get_executor_manager()->get_idle_cpu_streams_executor(executor_config);
     }
     if (0 != m_cfg.streamExecutorConfig.get_streams()) {
-        m_callback_executor = m_plugin->get_executor_manager()->get_idle_cpu_streams_executor(
-            IStreamsExecutor::Config{"CPUCallbackExecutor", 1, 0});
+        //m_callback_executor = m_plugin->get_executor_manager()->get_idle_cpu_streams_executor(
+        //    IStreamsExecutor::Config{"CPUCallbackExecutor", 1, 0});
     } else {
-        m_callback_executor = m_task_executor;
+        //m_callback_executor = m_task_executor;
     }
 
     if (m_task_executor) {
-        set_task_executor(m_task_executor);
+        //set_task_executor(m_task_executor);
     }
     if (m_callback_executor) {
-        set_callback_executor(m_callback_executor);
+        //set_callback_executor(m_callback_executor);
     }
 
-    m_optimized_single_stream = all_of(1, executor_config.get_streams(), executor_config.get_threads());
+    //m_optimized_single_stream = all_of(1, executor_config.get_streams(), executor_config.get_threads());
 
-    int streams = std::max(1, executor_config.get_streams());
-    std::vector<Task> tasks;
-    tasks.resize(streams);
-    m_graphs.resize(streams);
-    if (executor_config.get_streams() != 0) {
-        auto all_graphs_ready = [&] {
-            return std::all_of(m_graphs.begin(), m_graphs.end(), [&](Graph& graph) {
-                return graph.IsReady();
-            });
-        };
-        do {
-            for (auto&& task : tasks) {
-                task = [this] {
-#if defined(OV_CPU_WITH_ACL)
-                    static std::once_flag flag_once;
-                    std::call_once(flag_once, [&]() {
-                        std::shared_ptr<arm_compute::IScheduler> acl_scheduler = std::make_shared<ACLScheduler>();
-                        arm_compute::Scheduler::set(std::static_pointer_cast<arm_compute::IScheduler>(acl_scheduler));
-                    });
-#endif
-                    CompiledModel::get_graph();
-                };
+
+#if 1
+    //int streams = std::max(1, executor_config.get_streams());
+    int streams = 4;
+
+    // Initialize per-stream executors for round-robin request binding
+    if (streams > 1) {
+        //auto base_table = m_cfg.streamExecutorConfig.get_streams_info_table();
+        //auto base_table = m_cfg.streamExecutorConfig.get_streams_info_table();
+        auto base_table = m_cfg.streamsInfoTable;
+        // Fallback: build a minimal table from m_cfg when no streams info is provided
+
+        m_stream_executors.reserve(streams);
+        for (int i = 0; i < streams; ++i) {
+            std::vector<std::vector<int>> one_row_table;
+            if (!base_table.empty()) {
+                // Use the i-th row; enforce single stream in that row
+                if (i < static_cast<int>(base_table.size())) {
+                    one_row_table.push_back(base_table[i]);
+                } else {
+                    one_row_table.push_back(base_table.back());
+                }
+                one_row_table[0][ov::NUMBER_OF_STREAMS] = 1;
             }
-            m_task_executor->run_and_wait(tasks);
-        } while (!all_graphs_ready());
-    } else {
+            // Debug: log per-stream executor selection details
+            int selected_row = -1;
+            if (!base_table.empty()) {
+                selected_row = i < static_cast<int>(base_table.size()) ? i
+                                                                      : static_cast<int>(base_table.size()) - 1;
+            }
+            std::cerr << "[CPU] Creating per-stream executor idx=" << i
+                      << " selected_row=" << selected_row
+                      << " rows=" << one_row_table.size()
+                      << " NUMBER_OF_STREAMS="
+                      << (one_row_table.empty() ? 0 : one_row_table[0][ov::NUMBER_OF_STREAMS])
+                      << std::endl;
+            executor_config = IStreamsExecutor::Config{"CPUPerStreamExecutor",
+                                                           1,
+                                                           0,
+                                                           ov::hint::SchedulingCoreType::ANY_CORE,
+                                                           /*cpu_reservation*/ true,
+                                                           /*cpu_pinning*/ true,
+                                                           /*cores_limit*/ true,
+                                                           std::move(one_row_table)};
+            auto exec = m_plugin->get_executor_manager()->get_idle_cpu_streams_executor(executor_config);
+            m_stream_executors.push_back(exec);
+        }
+    }
+#endif
+
+    // Choose request executor for main tasks; default to first stream if available
+    m_task_executor = m_stream_executors.empty() ? std::make_shared<ImmediateSerialExecutor>()
+                                                 : m_stream_executors[0];
+
+    // TEMP: Force exactly 4 graph instances regardless of executor count
+    int graphs = 4;
+    m_graphs.resize(graphs);
+
+    // Initialize all graphs deterministically by forcing selection via TLS
+    for (int gi = 0; gi < graphs; ++gi) {
+        CompiledModel::set_current_graph_idx(gi);
         CompiledModel::get_graph();
+        CompiledModel::set_current_graph_idx(-1);
     }
     if (m_cfg.numSubStreams > 0) {
         m_has_sub_compiled_models = true;
@@ -179,12 +226,18 @@ CompiledModel::GraphGuard::Lock CompiledModel::get_graph() const {
 
     size_t graph_idx = 0;
     if (m_graphs.size() > 1) {
-        auto streamsExecutor = std::dynamic_pointer_cast<IStreamsExecutor>(m_task_executor);
-        if (nullptr != streamsExecutor) {
-            streamId = streamsExecutor->get_stream_id();
-            socketId = std::max(0, streamsExecutor->get_socket_id());
+        // Prefer thread-local graph index if set by AsyncInferRequest
+        int tls_idx = CompiledModel::current_graph_idx();
+        if (tls_idx >= 0) {
+            graph_idx = static_cast<size_t>(tls_idx % static_cast<int>(m_graphs.size()));
+        } else {
+            auto streamsExecutor = std::dynamic_pointer_cast<IStreamsExecutor>(m_task_executor);
+            if (nullptr != streamsExecutor) {
+                streamId = streamsExecutor->get_stream_id();
+                socketId = std::max(0, streamsExecutor->get_socket_id());
+            }
+            graph_idx = streamId % m_graphs.size();
         }
-        graph_idx = streamId % m_graphs.size();
     }
 
     auto graphLock = GraphGuard::Lock(m_graphs[graph_idx]);
@@ -234,20 +287,66 @@ std::shared_ptr<ov::ISyncInferRequest> CompiledModel::create_sync_infer_request(
 
 std::shared_ptr<ov::IAsyncInferRequest> CompiledModel::create_infer_request() const {
     auto internal_request = create_sync_infer_request();
+    // Round-robin select per-stream executor if available
+    std::shared_ptr<ov::threading::ITaskExecutor> request_executor = get_task_executor();
+    std::shared_ptr<ov::threading::ITaskExecutor> callback_executor = get_callback_executor();
+    //m_optimized_single_stream = 1;
+    std::cerr << "[CPU] create_infer_request: internal_request=" << internal_request.get()
+              << " streams_available=" << m_stream_executors.size()
+              << " optimized_single_stream=" << (m_optimized_single_stream ? 1 : 0)
+              << std::endl;
+
+    int selected_idx = -1;
+    if (!m_stream_executors.empty()) {
+        int prev = m_next_stream.fetch_add(1);
+        int idx = prev;
+        if (!m_stream_executors.empty()) {
+            idx = idx % static_cast<int>(m_stream_executors.size());
+        } else {
+            idx = 0;
+        }
+        request_executor = m_stream_executors[idx];
+        selected_idx = idx;
+        std::cerr << "[CPU] Request executor round-robin: prev=" << prev
+                  << " selected_idx=" << idx
+                  << " total=" << m_stream_executors.size()
+                  << " request_executor_ptr=" << request_executor.get()
+                  << std::endl;
+        // Optionally use same executor for callback; keep existing behavior by default
+        callback_executor = request_executor;
+    }
+
     auto async_infer_request =
         std::make_shared<AsyncInferRequest>(std::static_pointer_cast<SyncInferRequest>(internal_request),
-                                            get_task_executor(),
-                                            get_callback_executor(),
+                                            request_executor,
+                                            callback_executor, 
                                             m_optimized_single_stream);
+
+    // Tag async request with selected stream index for per-thread graph selection
+    if (selected_idx >= 0) {
+        static_cast<ov::intel_cpu::AsyncInferRequest*>(async_infer_request.get())->set_stream_index(selected_idx);
+    }
+
+    std::cerr << "[CPU] AsyncInferRequest created: req_exec=" << request_executor.get()
+              << " cb_exec=" << callback_executor.get()
+              << " has_sub_models=" << (m_has_sub_compiled_models ? 1 : 0)
+              << std::endl;
+
     if (m_has_sub_compiled_models) {
         std::vector<std::shared_ptr<IAsyncInferRequest>> requests;
         requests.reserve(m_sub_compiled_models.size());
-        for (const auto& model : m_sub_compiled_models) {
-            requests.push_back(model->create_infer_request());
+        std::cerr << "[CPU] Configuring sub infer: sub_models=" << m_sub_compiled_models.size() << std::endl;
+        for (size_t i = 0; i < m_sub_compiled_models.size(); ++i) {
+            auto& model = m_sub_compiled_models[i];
+            auto sub_req = model->create_infer_request();
+            std::cerr << "[CPU] Sub request created idx=" << i << " ptr=" << sub_req.get() << std::endl;
+            requests.push_back(std::move(sub_req));
         }
         async_infer_request->setSubInferRequest(requests);
         async_infer_request->setSubInfer(true);
+        std::cerr << "[CPU] Sub infer configured" << std::endl;
     }
+
     return async_infer_request;
 }
 
