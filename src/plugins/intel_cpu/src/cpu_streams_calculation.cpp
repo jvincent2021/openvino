@@ -883,17 +883,20 @@ std::vector<std::vector<int>> generate_stream_info(const int streams,
     config.tbbPartitioner =
         config.tbbPartitioner == TbbPartitioner::NONE ? TbbPartitioner::STATIC : config.tbbPartitioner;
     OPENVINO_ASSERT(!streams_info_table.empty(), "streams_info_table is empty!");
+    // Persist streams info into config for later use
+    config.streamsInfoTable = streams_info_table;
     if (config.modelDistributionPolicy.find(ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL) !=
         config.modelDistributionPolicy.end()) {
         config.streamsRankTable =
             get_streams_rank_table(streams_info_table, config.streamsRankLevel, config.numSubStreams);
     }
 
+
     config.enableCpuPinning = check_cpu_pinning(config.enableCpuPinning,
                                                 config.changedCpuPinning,
                                                 config.enableCpuReservation,
                                                 streams_info_table);
-
+#if 0 
     config.streamExecutorConfig = IStreamsExecutor::Config{"CPUStreamsExecutor",
                                                            config.streams,
                                                            config.threadsPerStream,
@@ -904,6 +907,9 @@ std::vector<std::vector<int>> generate_stream_info(const int streams,
                                                            std::move(streams_info_table),
                                                            {},
                                                            false};
+#endif
+
+
     return proc_type_table;
 }
 
